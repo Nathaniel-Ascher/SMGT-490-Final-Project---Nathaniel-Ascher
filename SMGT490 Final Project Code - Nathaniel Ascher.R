@@ -8,9 +8,7 @@ library(ggplot2)
 
 setwd("~/Downloads")
 savant2024 = read.csv("savant2024.csv")
-savant2025 <- sabRmetrics::download_baseballsavant(
-  start_date = "2025-03-27",
-  end_date = "2025-09-28")
+savant2025 <- sabRmetrics::download_baseballsavant(start_date = "2025-03-27", end_date = "2025-09-28")
 
 colnames(savant2024)
 
@@ -465,15 +463,148 @@ ggplot(streak10_data, aes(x = sd_swing_tilt, y = sd_window_woba)) +
   theme_classic() + theme(plot.title = element_text(face = "bold"))
 
 
+###Web App Code to get RDS:
+library(shiny)
+library(dplyr)
+library(mgcv)
+library(ggplot2)
+library(plotly)
+library(tidyr)
 
+savant2025 <- sabRmetrics::download_baseballsavant(
+  start_date = "2025-03-27",
+  end_date = "2025-09-28")
 
+division_lookup <- tibble(player_team = c("CWS", "KC", "DET", "MIN", "CLE",
+                                          "HOU", "ATH", "TEX", "LAA", "SEA",
+                                          "NYY", "TOR", "BOS", "BAL", "TB",
+                                          "MIL", "CIN", "STL", "PIT", "CHC",
+                                          "LAD", "SF", "SD", "COL", "AZ",
+                                          "PHI", "MIA", "NYM", "WSH", "ATL"),
+                          division = c(rep("AL Central", 5),
+                                       rep("AL West", 5),
+                                       rep("AL East", 5),
+                                       rep("NL Central", 5),
+                                       rep("NL West", 5),
+                                       rep("NL East", 5)))
 
+all_divisions <- c("AL Central", "AL West", "AL East", "NL Central", "NL West", "NL East")
 
+all_teams <- division_lookup$player_team
 
+batter_team_lookup <- savant2025 %>%
+  mutate(batter_id_fullseason = as.character(batter_id),
+         player_team = as.character(home_team)) %>%
+  filter(!is.na(batter_id_fullseason),
+         !is.na(player_team), inning_topbot == "Bot") %>%
+  count(batter_id_fullseason, player_team, name = "team_rows") %>%
+  group_by(batter_id_fullseason) %>%
+  arrange(desc(team_rows), .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup() %>%
+  left_join(division_lookup, by = "player_team")
 
+swing_desc <- c("swinging_strike", "swinging_strike_blocked", "foul", "foul_tip", "hit_into_play")
 
+swing_context_data <- savant2025 %>%
+  mutate(batter_id_fullseason = as.character(batter_id),
+         swing_tilt_fullseason = as.numeric(swing_path_tilt),
+         balls_fullseason = pmax(pmin(as.integer(balls), 3), 0),
+         strikes_fullseason = pmax(pmin(as.integer(strikes), 2), 0),
+         plate_x_fullseason = as.numeric(plate_x),
+         plate_z_fullseason = as.numeric(plate_z),
+         pitch_type_fullseason = as.character(pitch_type),
+         pitch_group_fullseason = case_when(
+           pitch_type_fullseason %in% c("FF", "SI", "FC") ~ "Fastball",
+           pitch_type_fullseason %in% c("CH", "FS", "FO", "SC") ~ "Offspeed",
+           pitch_type_fullseason %in% c("CU", "KC", "CS", "SL", "ST", "SV") ~ "Breaking",
+           pitch_type_fullseason == "KN" ~ "Knuckleball",
+           TRUE ~ NA_character_),
+         pitch_group_fullseason = factor(pitch_group_fullseason)) %>%
+  filter(description %in% swing_desc,
+         !pitch_type_fullseason %in% c("PO", "UN", "FA", "EP"),
+         !is.na(batter_id_fullseason),
+         !is.na(swing_tilt_fullseason), is.finite(swing_tilt_fullseason),
+         !is.na(balls_fullseason),
+         !is.na(strikes_fullseason),
+         !is.na(plate_x_fullseason), is.finite(plate_x_fullseason),
+         !is.na(plate_z_fullseason), is.finite(plate_z_fullseason),
+         !is.na(pitch_group_fullseason))
 
+min_model_swings <- 200
 
+player_tilt_prediction_relationship <- swing_context_data %>%
+  group_by(batter_id_fullseason) %>%
+  group_modify(~{
+    batter_swing_data_fullseason <- .x
+    
+    if (nrow(batter_swing_data_fullseason) < min_model_swings) {
+      return(tibble(
+        swings_fullseason = nrow(batter_swing_data_fullseason),
+        actual_predicted_tilt_correlation = NA_real_))}
+    
+    swing_context_model_fullseason <- tryCatch(
+      gam(swing_tilt_fullseason ~
+            pitch_group_fullseason +
+            balls_fullseason +
+            strikes_fullseason +
+            s(plate_x_fullseason, k = 6) +
+            s(plate_z_fullseason, k = 6),
+          data = batter_swing_data_fullseason,
+          method = "REML"),
+      error = function(e) NULL)
+    
+    if (is.null(swing_context_model_fullseason)) {
+      return(tibble(
+        swings_fullseason = nrow(batter_swing_data_fullseason),
+        actual_predicted_tilt_correlation = NA_real_))}
+    
+    predicted_swing_tilt_fullseason <- predict(
+      swing_context_model_fullseason,
+      newdata = batter_swing_data_fullseason,
+      type = "response")
+    
+    tibble(swings_fullseason = nrow(batter_swing_data_fullseason),
+           actual_predicted_tilt_correlation = cor(
+             batter_swing_data_fullseason$swing_tilt_fullseason,
+             predicted_swing_tilt_fullseason,
+             use = "complete.obs"))}) %>%
+  ungroup() %>%
+  filter(!is.na(actual_predicted_tilt_correlation))
 
+plate_appearance_endpoints_fullseason <- savant2025 %>%
+  mutate(batter_id_fullseason = as.character(batter_id)) %>%
+  filter(!is.na(batter_id_fullseason),
+         !is.na(game_id),
+         !is.na(at_bat_number),
+         is.na(events) | events != "truncated_pa") %>%
+  arrange(game_id, at_bat_number, pitch_number) %>%
+  group_by(game_id, at_bat_number) %>%
+  slice_tail(n = 1) %>%
+  ungroup() %>%
+  mutate(strikeout_indicator_fullseason = if_else(events %in% c("strikeout", "strikeout_double_play"), 1, 0))
 
+player_strikeout_rates_fullseason <- plate_appearance_endpoints_fullseason %>%
+  group_by(batter_id_fullseason) %>%
+  summarise(plate_appearances_fullseason = n(),
+            strikeouts_fullseason = sum(strikeout_indicator_fullseason, na.rm = TRUE),
+            strikeout_rate_fullseason = strikeouts_fullseason / plate_appearances_fullseason,
+            .groups = "drop") %>%
+  left_join(savant2025 %>%
+              transmute(batter_id_fullseason = as.character(batter_id),
+                        batter_name_fullseason = batter_name) %>%
+              distinct(), by = "batter_id_fullseason") %>%
+  select(batter_name_fullseason,
+         batter_id_fullseason,
+         plate_appearances_fullseason,
+         strikeouts_fullseason,
+         strikeout_rate_fullseason)
 
+tilt_correlation_vs_strikeout_fullseason <- player_tilt_prediction_relationship %>%
+  inner_join(player_strikeout_rates_fullseason, by = "batter_id_fullseason") %>%
+  left_join(batter_team_lookup, by = "batter_id_fullseason") %>%
+  filter(!is.na(batter_name_fullseason),
+         !is.na(player_team),
+         !is.na(division))
+
+saveRDS(tilt_correlation_vs_strikeout_fullseason, "tilt_correlation_vs_strikeout_fullseason.rds")
